@@ -1,0 +1,111 @@
+# BLIP ile Görsel Alt Yazı Üretimi - Kaggle Yarışması
+
+# 1. Kurulumlar ve Yollar
+model_path = "/kaggle/input/blip-model-local"
+train_path = "/kaggle/input/train-dataset"
+
+define_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# 2. Model ve Processor Yüklenmesi
+from transformers import BlipProcessor, BlipForConditionalGeneration
+processor = BlipProcessor.from_pretrained(f"{model_path}/blip-model")
+model = BlipForConditionalGeneration.from_pretrained(f"{model_path}/blip-model")
+model.to(define_device)
+
+# 3. Veriseti Hazırlama
+from datasets import load_dataset
+from PIL import Image
+import os
+
+def transform(example):
+    image_path = os.path.join(f"{train_path}/train", str(example["image_id"]) + ".jpg")
+    image = Image.open(image_path).convert("RGB")
+    encoding = processor(
+        images=image,
+        text=example["caption"],
+        return_tensors="pt",
+        padding="max_length",
+        truncation=True
+    )
+    return {
+        "pixel_values": encoding["pixel_values"][0],
+        "input_ids": encoding["input_ids"][0],
+        "attention_mask": encoding["attention_mask"][0],
+    }
+
+processed_data = dataset.map(transform)
+processed_data.set_format(type="torch")
+
+# 4. Dataloader
+from torch.utils.data import DataLoader
+train_loader = DataLoader(processed_data, batch_size=8, shuffle=True)
+
+# 5. Eğitim
+def train():
+    import gc
+    from tqdm import tqdm
+    from torch.optim import AdamW
+
+    optimizer = AdamW(model.parameters(), lr=5e-5)
+    model.train()
+
+    for epoch in range(3):
+        total_loss = 0
+        for batch in tqdm(train_loader):
+            pixel_values = batch["pixel_values"].to(define_device)
+            input_ids = batch["input_ids"].to(define_device)
+            attention_mask = batch["attention_mask"].to(define_device)
+
+            outputs = model(
+                pixel_values=pixel_values,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=input_ids
+            )
+            loss = outputs.loss
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+            total_loss += loss.item()
+
+            del pixel_values, input_ids, attention_mask, outputs
+            torch.cuda.empty_cache()
+            gc.collect()
+
+        print(f"Epoch {epoch+1} Loss: {total_loss:.4f}")
+
+train()
+
+# 6. Model ve Processor Kaydetme
+model.save_pretrained("/kaggle/working/blip-custom-model")
+processor.save_pretrained("/kaggle/working/blip-custom-processor")
+
+# 7. Test Verisi Üzerinde Tahmin
+import pandas as pd
+import os
+from PIL import Image
+from tqdm import tqdm
+
+# Test verisi okunur
+test_df = pd.read_csv("/kaggle/input/test-data/test.csv")
+
+results = []
+for image_id in tqdm(test_df["image_id"]):
+    image_path = f"/kaggle/input/test-data/test/test/{image_id}.jpg"
+    image = Image.open(image_path).convert("RGB")
+
+    inputs = processor(images=image, return_tensors="pt").to(define_device)
+
+    model.eval()
+    with torch.no_grad():
+        output = model.generate(**inputs)
+        caption = processor.decode(output[0], skip_special_tokens=True)
+        results.append({"image_id": image_id, "caption": caption})
+
+# 8. Submission.csv
+submission_df = pd.DataFrame(results)
+submission_df.to_csv("submission.csv", index=False)
+
+# 9. Kalıcı Kaydetme (zip)
+!zip -r blip-model.zip /kaggle/working/blip-custom-model
+!zip -r processor.zip /kaggle/working/blip-custom-processor
